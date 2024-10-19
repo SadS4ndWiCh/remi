@@ -5,38 +5,22 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
-#define HOST ((uint32_t) INADDR_LOOPBACK)
-#define PORT ((uint16_t) 3000)
+#define REMI_HOST INADDR_LOOPBACK
+#define REMI_PORT 3000
+#define REMI_MAX_QUEUE 10
+#define REMI_MESSAGE_LENGTH 4
+#define REMI_MESSAGE_PAYLOAD 4096
 
-struct AppendBuffer {
-    char *data;
-    size_t len;
-};
-
-int AppendBuffer_append(struct AppendBuffer *ab, char *data, size_t len) {
-    ab->data = realloc(ab->data, ab->len + len);
-    if (ab->data == NULL) {
-        return -1;
-    }
-
-    memcpy(ab->data + ab->len, data, len);
-    ab->len += len;
-    return 0;
-}
-
-void AppendBuffer_free(struct AppendBuffer *ab) {
-    free(ab->data);
-}
-
-int setup_socket(uint32_t host, uint16_t port) {
+static int setup_socket(uint32_t host, uint16_t port) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd == -1) {
-        fprintf(stderr, "ERROR: socket() failed to create socket.\n");
+        fprintf(stderr, "ERROR: socket() failed to create server socket.\n");
         exit(EXIT_FAILURE);
     }
 
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int)) == -1) {
-        fprintf(stderr, "ERROR: setsockopt() failed to set `SO_REUSEADDR` socket option.\n");
+    int reuse = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == -1) {
+        fprintf(stderr, "ERROR: setsockopt() failed to set `SO_REUSEADDR` option.\n");
         exit(EXIT_FAILURE);
     }
 
@@ -47,99 +31,109 @@ int setup_socket(uint32_t host, uint16_t port) {
     };
 
     if (bind(server_fd, (struct sockaddr *) &addr, sizeof(addr)) == -1) {
-        fprintf(stderr, "ERROR: bind() failed to bind the address to socket.\n");
+        fprintf(stderr, "ERROR: bind() failed to bind address to the socket.\n");
         exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, 10) == -1) {
-        fprintf(stderr, "ERROR: listen() failed to start listening to connections.\n");
+    if (listen(server_fd, REMI_MAX_QUEUE) == -1) {
+        fprintf(stderr, "ERROR: listen() failed to start listening for connections.\n");
         exit(EXIT_FAILURE);
     }
 
     return server_fd;
 }
 
-int accept_conn(int server_fd) {
-    struct sockaddr_in client_addr;
-    socklen_t client_addr_len;
-
-    return accept(server_fd, (struct sockaddr *) &client_addr, &client_addr_len);
-}
-
-char *read_request(int client_fd) {
-    struct AppendBuffer ab = { NULL, 0 };
-
-    char buf[128] = {0};
-    while (1) {
-        ssize_t nbytes = recv(client_fd, buf, sizeof(buf) / sizeof(buf[0]), 0);
-        if (nbytes <= 0) {
-            break;
+static int rread(int fd, char *buf, size_t n) {
+    while (n > 0) {
+        ssize_t bytes = recv(fd, buf, n, 0);
+        if (bytes == -1) {
+            return -1;
         }
 
-        if (AppendBuffer_append(&ab, buf, (size_t) nbytes) == -1) {
-            fprintf(stderr, "ERROR: AppendBuffer_append() failed to append data to buffer: %s\n", buf);
-            break;
-        }
-    }
-
-    return ab.data;
-}
-
-int main(void) {
-    int server_fd = setup_socket(HOST, PORT);
-
-    fprintf(stdout, "INFO: remi started to listen in :%d\n", PORT);
-
-    while (1) {
-        int client_fd = accept_conn(server_fd);
-        if (client_fd == -1) {
-            fprintf(stderr, "ERROR: accept_conn() failed to accept a new connection\n");
-            continue;
+        if ((size_t) bytes > n) {
+            return -1;
         }
 
-        fprintf(stdout, "INFO: new connection stablished\n");
-
-        char *payload = read_request(client_fd);
-        if (payload == NULL) {
-            fprintf(stdout, "WARN: read_request() receives a empty payload\n");
-
-            close(client_fd);
-            continue;
-        }
-
-        size_t payload_len = strlen(payload);
-        if (payload_len < 4) {
-            fprintf(stdout, "WARN: any command must have at least 4 bytes\n");
-
-            close(client_fd);
-            free(payload);
-            continue;
-        }
-
-        char *token_ptr;
-
-        char *magic = strtok_r(payload, " ", &token_ptr);
-        if (strcmp(magic, "remi") != 0) {
-            fprintf(stdout, "WARN: that is not a message that Remi can understand :(\n");
-
-            close(client_fd);
-            free(payload);
-            continue;
-        }
-
-        char *command = strtok_r(NULL, " ", &token_ptr);
-        if (command == NULL) {
-            fprintf(stdout, "WARN: Remi receives a empty message\n");
-        } else if (strcmp(command, "ADD") == 0) {
-            char *key = strtok_r(NULL, " ", &token_ptr);
-            char *val = strtok_r(NULL, " ", &token_ptr);
-
-            fprintf(stdout, "INFO: added: { '%s': '%s' }\n", key, val);
-        }
-
-        close(client_fd);
-        free(payload);
+        n -= bytes;
+        buf += bytes;
     }
 
     return 0;
+}
+
+static int rwrite(int fd, const char *buf, size_t n) {
+    while (n > 0) {
+        ssize_t bytes = send(fd, buf, n, 0);
+        if (bytes == -1) {
+            return -1;
+        }
+
+        if ((size_t) bytes > n) {
+            return -1;
+        }
+
+        n -= bytes;
+        buf += bytes;
+    }
+
+    return 0;
+}
+
+int handle_request(int client_fd) {
+    char message[REMI_MESSAGE_LENGTH + REMI_MESSAGE_PAYLOAD + 1];
+    memset(message, 0, REMI_MESSAGE_LENGTH + REMI_MESSAGE_PAYLOAD + 1);
+    if (rread(client_fd, message, REMI_MESSAGE_LENGTH) == -1) {
+        fprintf(stderr, "ERROR: rread() failed to read request header.\n");
+        return -1;
+    }
+
+    uint32_t payload_len = 0;
+    memcpy(&payload_len, message, REMI_MESSAGE_LENGTH);
+    if (payload_len > REMI_MESSAGE_PAYLOAD) {
+        fprintf(stderr, "ERROR: client sent a too long request payload.\n");
+        return -1;
+    }
+
+    if (rread(client_fd, &message[REMI_MESSAGE_LENGTH], payload_len) == -1) {
+        fprintf(stderr, "ERROR: rread() failed to read the message payload.\n");
+        return -1;
+    }
+
+    fprintf(stdout, "INFO: client sent: '%s'\n", &message[REMI_MESSAGE_LENGTH]);
+
+    const char reply[] = "Good job my friend! :)";
+    char replay_message[REMI_MESSAGE_LENGTH + strlen(reply)];
+
+    uint32_t reply_len = strlen(reply);
+    memcpy(replay_message, &reply_len, REMI_MESSAGE_LENGTH);
+    memcpy(replay_message + REMI_MESSAGE_LENGTH, reply, reply_len);
+
+    if (rwrite(client_fd, replay_message, REMI_MESSAGE_LENGTH + reply_len) == -1) {
+        fprintf(stderr, "ERROR: rwrite() failed to send reply to client.\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+int main(void) {
+    int server_fd = setup_socket(REMI_HOST, REMI_PORT);
+
+    while (1) {
+        int client_fd = accept(server_fd, NULL, NULL);
+        if (client_fd == -1) {
+            fprintf(stderr, "ERROR: accept() failed to accept client connection.\n");
+            continue;
+        }
+
+        while (1) {
+            if (handle_request(client_fd) == -1) {
+                break;
+            }
+        }
+
+        close(client_fd);
+    }
+
+    return EXIT_SUCCESS;
 }
