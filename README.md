@@ -21,3 +21,17 @@ You                    Remi!
  |                       |
  |                       |
 ```
+
+## 🔭 Remi Protocol Specification
+
+The Remi Protocol is very simple to Remi can understand. You understand?
+
+```
++--------+---------+--------+---------+---------
+| length | message | length | message | more... 
++--------+---------+--------+---------+---------
+```
+
+Each message must have two fields, the `length` (4 bytes) that is the message 
+length  and the `message` (n bytes) it self. A client can send multiple messages 
+to Remi. But be careful, some misspelled message can confuse Remi.
